@@ -1,0 +1,16 @@
+{
+  "[typescript][typescriptreact][json]": {
+    "editor.codeActionsOnSave": {
+      "quickfix.biome": "explicit",
+      "source.fixAll": "explicit"
+    },
+    "editor.defaultFormatter": "biomejs.biome",
+    "editor.formatOnSave": true
+  },
+  "files.associations": {
+    "*.json": "json"
+  },
+  "search.exclude": {
+    "bun.lock": true
+  }
+}
