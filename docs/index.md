@@ -1,6 +1,11 @@
 # TypeScript
 
-## 00.オブジェクト
+このページにはAIに読み書きしやすいコードを生成する為の知見をまとめています。
+
+今日のAIはToolsを通してターミナルやブラウザの出力をコンテキストに含めることができます。
+多くの不具合を型レベルで検出できる事、ランタイムでも検出できる事を重点的に考えています。
+
+## 00.イミュータブルなオブジェクト
 
 最初に基本的なオブジェクトを定義します。
 
@@ -20,7 +25,24 @@ const monster: Monster = {
 
 型の定義により、オブジェクトの構造が明確になります。この段階では、プロパティの直接変更が可能です。
 
-## 01.イミュータブル
+```ts
+type Monster = {
+  name: string
+  hp: number
+  mp: number
+}
+
+const monster: Monster = {
+  name: "slime",
+  hp: 16,
+  mp: 8
+}
+
+monster.hp += 16 // 32
+monster.mp -= 8 // 0
+
+console.log(monster.hp) // 32
+```
 
 魔法を唱えることでMPを消費してHPを回復させる処理を実装します。
 
@@ -89,6 +111,40 @@ console.log(monster.hp) // 16（元の値は保持される）
 ```
 
 この方法により、元のオブジェクトは変更されず、状態変更の履歴が追跡可能になります。
+
+## 01.オブジェクトを検証する
+
+間違ったオブジェクトが定義されないようにランタイムでのバリデーションを行います。
+
+```ts
+const zMonster = z.object({
+  name: z.string(),
+  hp: z.number(),
+})
+
+const monster = Object.freeze(
+  zMonster.parse({
+    name: 'slime',
+    hp: 16,
+  })
+)
+```
+
+更にこのように型を定義する事で型レベルの検証が可能になります。
+
+```ts
+const zMonster = z.object({
+  name: z.string(),
+  hp: z.number(),
+})
+
+type Monster = z.infer<typeof zMonster>
+
+const monster = zMonster.parse({
+  name: 'slime',
+  hp: 16,
+} satisfies Monster)
+```
 
 ## 02.ビジネスルールの導入
 
@@ -874,3 +930,549 @@ console.log("result", result)
 ```
 
 Union型により、TypeScriptの型システムが各種類を適切に識別し、型安全性が保たれます。新しい種類を追加した際の対応漏れもコンパイル時に検出できます。
+
+## 有限オートマトン
+
+1つのEntityを特定の用途で分離するのには、他にも利点があります。
+
+戦闘では、段階ごとに状態が変化します。この状態変化を有限オートマトンパターンで表現することで、複雑な戦闘フローを明確に管理できます。
+
+まず、有限オートマトンを使わない場合の問題を確認します。単一のEntityで段階を管理する実装を考えてみます。
+
+```ts
+import { z } from "zod/v4"
+import { PlayerEntity } from "./domain/entities/player-entity"
+import { MonsterEntity } from "./domain/entities/monster-entity"
+
+const zBattleEntityProps = z.object({
+  id: z.string(),
+  player: z.instanceof(PlayerEntity),
+  monster: z.instanceof(MonsterEntity),
+  phase: z.enum(["preparation", "execution", "end"]),
+})
+
+type Props = z.infer<typeof zBattleEntityProps>
+
+class BattleEntity implements Props {
+  readonly id!: string
+  readonly player!: PlayerEntity
+  readonly monster!: MonsterEntity
+  readonly phase!: "preparation" | "execution" | "end"
+
+  constructor(props: Props) {
+    Object.assign(this, zBattleEntityProps.parse(props))
+    Object.freeze(this)
+  }
+
+  withPhase(newPhase: "preparation" | "execution" | "end"): BattleEntity {
+    return new BattleEntity({
+      ...this,
+      phase: newPhase,
+    })
+  }
+}
+```
+
+この実装には以下の問題があります：
+
+```ts
+const battle = new BattleEntity({
+  id: crypto.randomUUID(),
+  player: PlayerEntity.create(),
+  monster: MonsterEntity.createFromLevel(3),
+  phase: "preparation",
+})
+
+// 問題1: 不正な段階遷移がコンパイル時に検出されない
+const invalidBattle = battle.withPhase("end") // preparation → end への直接遷移
+
+// 問題2: 論理的に正しくない状態でも作成できてしまう
+const inconsistentBattle = battle.withPhase("end") // 戦闘が終了しているが勝者が不明
+
+// 問題3: 段階の制約がメソッドレベルで表現されない
+// どの段階でも withPhase が呼び出し可能
+```
+
+これらの問題を解決するため、段階ごとに異なるEntityクラスを定義する有限オートマトンパターンを使用します。
+
+戦闘は以下の3つの段階を持つものとします:
+
+- 準備段階: 戦闘開始前の状態
+- 実行段階: 戦闘行動を実行する段階
+- 終了段階: 戦闘が完了した状態
+
+各段階を表現するEntityを定義します。
+
+```ts
+import { z } from "zod/v4"
+import { PlayerEntity } from "./domain/entities/player-entity"
+import { MonsterEntity } from "./domain/entities/monster-entity"
+
+const zBattlePreparationProps = z.object({
+  id: z.string(),
+  player: z.instanceof(PlayerEntity),
+  monster: z.instanceof(MonsterEntity),
+})
+
+export class BattlePreparationEntity {
+  readonly id!: string
+  readonly player!: PlayerEntity
+  readonly monster!: MonsterEntity
+
+  constructor(props: z.infer<typeof zBattlePreparationProps>) {
+    Object.assign(this, zBattlePreparationProps.parse(props))
+    Object.freeze(this)
+  }
+
+  startBattle(): BattleExecutionEntity {
+    return new BattleExecutionEntity({
+      id: this.id,
+      player: this.player,
+      monster: this.monster,
+      turn: 1,
+    })
+  }
+}
+
+const zBattleExecutionProps = z.object({
+  id: z.string(),
+  player: z.instanceof(PlayerEntity),
+  monster: z.instanceof(MonsterEntity),
+  turn: z.number().min(1),
+})
+
+export class BattleExecutionEntity {
+  readonly id!: string
+  readonly player!: PlayerEntity
+  readonly monster!: MonsterEntity
+  readonly turn!: number
+
+  constructor(props: z.infer<typeof zBattleExecutionProps>) {
+    Object.assign(this, zBattleExecutionProps.parse(props))
+    Object.freeze(this)
+  }
+
+  executeAttack(): BattleExecutionEntity | BattleEndEntity {
+    const updatedPlayer = this.player.consumeMp(5)
+    const updatedMonster = this.monster.takeDamage(20)
+
+    if (updatedPlayer.isDead || updatedMonster.isDead) {
+      return new BattleEndEntity({
+        id: this.id,
+        player: updatedPlayer,
+        monster: updatedMonster,
+        winner: updatedPlayer.isDead ? "monster" : "player",
+      })
+    }
+
+    return new BattleExecutionEntity({
+      id: this.id,
+      player: updatedPlayer,
+      monster: updatedMonster,
+      turn: this.turn + 1,
+    })
+  }
+}
+
+const zBattleEndProps = z.object({
+  id: z.string(),
+  player: z.instanceof(PlayerEntity),
+  monster: z.instanceof(MonsterEntity),
+  winner: z.enum(["player", "monster"]),
+})
+
+export class BattleEndEntity {
+  readonly id!: string
+  readonly player!: PlayerEntity
+  readonly monster!: MonsterEntity
+  readonly winner!: "player" | "monster"
+
+  constructor(props: z.infer<typeof zBattleEndProps>) {
+    Object.assign(this, zBattleEndProps.parse(props))
+    Object.freeze(this)
+  }
+}
+```
+
+各状態クラスのメソッドで直接遷移します：
+
+```ts
+let battleState = new BattlePreparationEntity({
+  id: crypto.randomUUID(),
+  player: PlayerEntity.create(),
+  monster: MonsterEntity.createFromLevel(3),
+})
+
+// 準備段階から実行段階へ遷移
+battleState = battleState.startBattle()
+console.log("戦闘開始")
+
+// 実行段階で攻撃を繰り返し、終了条件まで継続
+while (battleState instanceof BattleExecutionEntity) {
+  const result = battleState.executeAttack()
+  
+  if (result instanceof BattleEndEntity) {
+    console.log(`戦闘終了 - 勝者: ${result.winner}`)
+    break
+  }
+  
+  battleState = result
+  console.log(`ターン ${battleState.turn} 完了`)
+}
+```
+
+より複雑な戦闘ロジックが必要な場合、遷移を管理するドメインサービスを定義できます：
+
+```ts
+type BattleState = BattlePreparationEntity | BattleExecutionEntity | BattleEndEntity
+
+class BattleTransitionService {
+  startBattle(preparation: BattlePreparationEntity): BattleExecutionEntity {
+    console.log("戦闘準備完了")
+    return preparation.startBattle()
+  }
+
+  executePlayerTurn(execution: BattleExecutionEntity): BattleExecutionEntity | BattleEndEntity {
+    console.log(`ターン ${execution.turn}: プレイヤーの攻撃`)
+    
+    const result = execution.executeAttack()
+    
+    if (result instanceof BattleEndEntity) {
+      console.log(`戦闘終了 - 勝者: ${result.winner}`)
+      return result
+    }
+
+    console.log(`ターン ${result.turn} 完了`)
+    return result
+  }
+
+  processBattle(initialState: BattlePreparationEntity): BattleExecutionEntity | BattleEndEntity {
+    const currentState: BattleState = this.startBattle(initialState)
+
+    if (currentState instanceof BattleExecutionEntity) {
+      return this.executePlayerTurn(currentState)
+    }
+
+    return currentState
+  }
+}
+
+const transitionService = new BattleTransitionService()
+
+const initialBattle = new BattlePreparationEntity({
+  id: crypto.randomUUID(),
+  player: PlayerEntity.create(),
+  monster: MonsterEntity.createFromLevel(3),
+})
+
+const finalResult = transitionService.processBattle(initialBattle)
+
+if (finalResult instanceof BattleEndEntity) {
+  console.log(`最終結果: ${finalResult.winner}の勝利`)
+} else {
+  console.log(`戦闘中断 - ターン ${finalResult.turn}`)
+}
+```
+
+## Repository
+
+Repositoryパターンは、データの永続化と取得を抽象化し、ドメインロジックからデータストレージの詳細を分離します。
+
+ローカルストレージを使用したリポジトリクラスを定義します。
+
+```ts
+import { PlayerEntity } from "./domain/entities/player-entity"
+import { HpValue } from "./domain/values/hp-value"
+
+class LocalStoragePlayerRepository {
+  private readonly storageKey = "players"
+
+  async save(player: PlayerEntity): Promise<void> {
+    const players = this.getAllPlayers()
+    const index = players.findIndex(p => p.id === player.id)
+    
+    const playerData = {
+      id: player.id,
+      hp: player.hp.value,
+      mp: player.mp.value,
+    }
+
+    if (index >= 0) {
+      players[index] = playerData
+    } else {
+      players.push(playerData)
+    }
+
+    localStorage.setItem(this.storageKey, JSON.stringify(players))
+  }
+}
+```
+
+Application Serviceでリポジトリを使用します。
+
+```ts
+const player = new PlayerEntity({
+  id: crypto.randomUUID(),
+  hp: new HpValue(100),
+  mp: new HpValue(50),
+})
+
+await this.playerRepository.save(player)
+```
+
+Repositoryパターンにより、データストレージの実装詳細がドメインロジックから分離されると考えられます。テスト時にはメモリ内実装、本番環境では異なるストレージ方式を使い分けることができると思われます。
+
+## Application Service
+
+ドメインサービスは純粋なビジネスロジックに集中しますが、アプリケーションとしては外部からの入力処理、永続化、トランザクション管理などが必要です。Application Serviceは、これらの責務を担当します。
+
+Application Serviceの返り値をAppStateEntityとして構造化します。
+
+```ts
+import { z } from "zod/v4"
+import { BattleEntity } from "./domain/entities/battle-entity"
+import { PlayerEntity } from "./domain/entities/player-entity"
+import { MonsterEntity } from "./domain/entities/monster-entity"
+
+const zBattleAppStateProps = z.object({
+  battleId: z.string(),
+  status: z.enum(["preparation", "ongoing", "finished"]),
+  playerData: z.object({
+    id: z.string(),
+    hp: z.number(),
+    mp: z.number(),
+  }),
+  monsterData: z.object({
+    id: z.string(),
+    hp: z.number(),
+  }),
+  turn: z.number(),
+  winner: z.enum(["player", "monster"]).nullable(),
+  message: z.string(),
+})
+
+type Props = z.infer<typeof zBattleAppStateProps>
+
+class BattleAppStateEntity implements Props {
+  readonly battleId!: Props["battleId"]
+  readonly status!: Props["status"]
+  readonly playerData!: Props["playerData"]
+  readonly monsterData!: Props["monsterData"]
+  readonly turn!: Props["turn"]
+  readonly winner!: Props["winner"]
+  readonly message!: Props["message"]
+
+  constructor(props: Props) {
+    Object.assign(this, zBattleAppStateProps.parse(props))
+    Object.freeze(this)
+  }
+
+  static fromBattleEntity(battle: BattleEntity, message: string): BattleAppStateEntity {
+    return new BattleAppStateEntity({
+      battleId: battle.id,
+      status: battle.isFinished ? "finished" : "ongoing",
+      playerData: {
+        id: battle.player.id,
+        hp: battle.player.hp.value,
+        mp: battle.player.mp.value,
+      },
+      monsterData: {
+        id: battle.monster.id,
+        hp: battle.monster.hp.value,
+      },
+      turn: battle.turn,
+      winner: battle.isFinished 
+        ? (battle.player.isDead ? "monster" : "player")
+        : null,
+      message,
+    })
+  }
+}
+
+type StartBattleRequest = {
+  playerId: string
+  monsterId: string
+}
+
+class BattleApplicationService {
+  async startBattle(request: StartBattleRequest): Promise<BattleAppStateEntity> {
+    // 入力値の検証
+    if (!request.playerId || !request.monsterId) {
+      throw new Error("Invalid request parameters")
+    }
+
+    // エンティティの取得（仮想的なリポジトリから）
+    const player = await this.playerRepository.findById(request.playerId)
+    const monster = await this.monsterRepository.findById(request.monsterId)
+
+    if (!player || !monster) {
+      throw new Error("Player or Monster not found")
+    }
+
+    // ドメインロジックの実行
+    const battle = new BattleEntity({
+      id: crypto.randomUUID(),
+      player,
+      monster,
+      turn: 0,
+      isFinished: false,
+    })
+
+    // 永続化
+    await this.battleRepository.save(battle)
+
+    return BattleAppStateEntity.fromBattleEntity(battle, "戦闘を開始しました")
+  }
+}
+```
+
+Application Serviceは以下の責務を持ちます：
+
+- 入力値の検証
+- 必要なEntityの取得
+- ドメインロジックの実行
+- 永続化処理
+- AppStateEntityとしての返り値の構築
+
+より複雑な戦闘実行処理を考えます。
+
+```ts
+type ExecuteAttackRequest = {
+  battleId: string
+  actionType: "attack" | "heal"
+}
+
+class BattleApplicationService {
+  async executeAttack(request: ExecuteAttackRequest): Promise<BattleAppStateEntity> {
+    // 戦闘状態の取得
+    const battle = await this.battleRepository.findById(request.battleId)
+    
+    if (!battle) {
+      throw new Error("Battle not found")
+    }
+
+    if (battle.isFinished) {
+      throw new Error("Battle is already finished")
+    }
+
+    // ドメインロジックの実行
+    let updatedBattle: BattleEntity
+    let actionMessage: string
+
+    if (request.actionType === "attack") {
+      updatedBattle = battle.castFireball()
+      actionMessage = "ファイアボールを詠唱しました"
+    } else {
+      updatedBattle = battle.castHeal()
+      actionMessage = "回復魔法を使用しました"
+    }
+
+    // ターン処理
+    updatedBattle = updatedBattle.nextTurn()
+
+    // 永続化
+    await this.battleRepository.save(updatedBattle)
+
+    // 戦闘終了メッセージの追加
+    if (updatedBattle.isFinished) {
+      const winner = updatedBattle.player.isDead ? "モンスター" : "プレイヤー"
+      actionMessage += ` - ${winner}の勝利です`
+    }
+
+    return BattleAppStateEntity.fromBattleEntity(updatedBattle, actionMessage)
+  }
+}
+```
+
+Application Serviceにより、外部インターフェース（REST API、CLI、UI等）とドメインロジックが分離されます。同じドメインロジックを異なるインターフェースから利用できるようになります。
+
+複数のドメインサービスを組み合わせる場合の例です。
+
+```ts
+import { BattleService } from "./domain/services/battle-service"
+import { LevelingService } from "./domain/services/leveling-service"
+import { ExpEngine } from "./domain/modules/exp-engine"
+
+const zQuestAppStateProps = z.object({
+  questId: z.string(),
+  playerId: z.string(),
+  status: z.enum(["completed", "failed"]),
+  playerLevel: z.number(),
+  expGained: z.number(),
+  message: z.string(),
+})
+
+class QuestAppStateEntity {
+  readonly questId!: string
+  readonly playerId!: string
+  readonly status!: "completed" | "failed"
+  readonly playerLevel!: number
+  readonly expGained!: number
+  readonly message!: string
+
+  constructor(props: z.infer<typeof zQuestAppStateProps>) {
+    Object.assign(this, zQuestAppStateProps.parse(props))
+    Object.freeze(this)
+  }
+}
+
+class GameApplicationService {
+  constructor(
+    private battleService: BattleService,
+    private levelingService: LevelingService,
+    private expEngine: ExpEngine
+  ) {}
+
+  async completeQuest(request: { playerId: string; questId: string }): Promise<null | Error> {
+    // プレイヤーとクエスト情報の取得
+    const player = await this.playerRepository.findById(request.playerId)
+    
+    const quest = await this.questRepository.findById(request.questId)
+
+    if (!player || !quest) {
+      throw new Error("Player or Quest not found")
+    }
+
+    // 戦闘処理
+    const battleResult = this.battleService.executeQuest(player, quest.monsters)
+    
+    // 経験値処理
+    const updatedPlayer = this.levelingService.addExp(
+      battleResult.player, 
+      quest.expReward
+    )
+
+    // 永続化
+    await this.playerRepository.save(updatedPlayer)
+    
+    await this.questRepository.markCompleted(quest.id, request.playerId)
+
+    return null
+  }
+}
+```
+
+Application Serviceは、ドメインロジックを組み合わせてアプリケーションの機能を実現します。AppStateEntityを使用することで、UIやAPIの詳細を知る必要がなく、純粋にアプリケーションの動作に集中できます。
+
+AppStateEntityの利点：
+
+- 型安全な返り値の保証
+- アプリケーション層での一貫した状態表現
+- UIコンポーネントとの疎結合
+- テストしやすい構造
+
+## T | Error
+
+下書き
+
+```ts
+const battleResult = this.battleService.executeQuest(player, quest.monsters)
+
+if (battleResult instanceof Error) {
+  return new ApplicationError("Battle failed")
+}
+```
+
+## Reducer
+
+下書き
